@@ -1052,6 +1052,39 @@ struct LogWrapper {
   }
 };
 
+// Callable for the table FilterIn -- for each value, call the
+// appropriate filter method to determine of the value should be kept or
+// removed.
+template <typename Filterer>
+struct FilterWrapper {
+  Filterer* filter_fn;
+
+  template <typename MustBeVoid, typename Trait>
+  struct TraitKey;
+
+  template <typename Trait>
+  struct TraitKey<absl::enable_if_t<IsEncodableTrait<Trait>::value, void>,
+                  Trait> {
+    static inline absl::string_view value() { return Trait::key(); };
+  };
+
+  // Do not filter non-encodable traits.
+  template <typename Trait>
+  struct TraitKey<absl::enable_if_t<!IsEncodableTrait<Trait>::value, void>,
+                  Trait> {
+    static inline absl::string_view value() { return ""; }
+  };
+
+  template <typename Which>
+  bool operator()(const Value<Which>& which) {
+    auto key = TraitKey<void, Which>::value();
+    if (key.empty()) {
+      return true;  // keep the field if it is not encodable.
+    }
+    return (*filter_fn)(key);
+  }
+};
+
 // Encoder to compute TransportSize
 class TransportSizeEncoder {
  public:
@@ -1093,6 +1126,16 @@ class UnknownMap {
 
   BackingType::const_iterator begin() const { return unknown_.cbegin(); }
   BackingType::const_iterator end() const { return unknown_.cend(); }
+
+  template <typename Filterer>
+  void Filter(Filterer* filter_fn) {
+    unknown_.erase(
+        std::remove_if(unknown_.begin(), unknown_.end(),
+                       [&](auto& pair) {
+                         return !(*filter_fn)(pair.first.as_string_view());
+                       }),
+        unknown_.end());
+  }
 
   bool empty() const { return unknown_.empty(); }
   size_t size() const { return unknown_.size(); }
@@ -1312,6 +1355,21 @@ class MetadataMap {
     for (const auto& unk : unknown_) {
       log_fn(unk.first.as_string_view(), unk.second.as_string_view());
     }
+  }
+
+  // Filter the metadata map.
+  // Iterates over all encodable and unknown headers and calls the filter_fn
+  // for each of them. If the function returns true, the header is kept.
+  // Otherwise it is removed. If include_known_encodable_headers is false, then
+  // only the unknown headers are filtered.
+  template <typename Filterer>
+  void Filter(Filterer filter_fn, bool include_known_encodable_headers) {
+    if (include_known_encodable_headers) {
+      table_.template FilterIn<metadata_detail::FilterWrapper<Filterer>,
+                               Value<Traits>...>(
+          metadata_detail::FilterWrapper<Filterer>{&filter_fn});
+    }
+    unknown_.Filter<Filterer>(&filter_fn);
   }
 
   std::string DebugString() const {
